@@ -6,9 +6,10 @@ import {
   useState,
   type FormEvent,
   type KeyboardEvent,
-  type ReactNode,
 } from 'react';
 import { NoteEditor } from '@shiori/editor';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {
   formatRelativeTime,
   normalizeTagName,
@@ -21,13 +22,13 @@ import {
 } from '@shiori/core';
 import {
   Archive,
-  Check,
   Circle,
   Cloud,
   Columns2,
   Eye,
   HelpCircle,
   FilePlus,
+  KeyRound,
   LogIn,
   LogOut,
   Mail,
@@ -37,11 +38,15 @@ import {
   Tag as TagIcon,
   Trash,
   Trash2,
+  UserPlus,
 } from 'lucide-react';
 import {
   getAuthSnapshot,
+  isEmailRateLimitError,
   sendMagicLink,
+  signInWithPassword,
   signOut,
+  signUpWithPassword,
   subscribeToAuthChanges,
   type AuthSnapshot,
 } from './auth';
@@ -53,6 +58,7 @@ const store = new LocalNoteStore();
 
 type SyncState = 'idle' | 'syncing' | 'synced' | 'failed';
 type EditorMode = 'edit' | 'preview' | 'split';
+type AuthMode = 'password' | 'magic-link';
 
 const autoSyncIntervalMs = 30_000;
 const autoSyncAfterChangeMs = 2_500;
@@ -153,151 +159,26 @@ function plainTextExcerpt(text: string): string {
   return normalized || '本文はまだありません';
 }
 
-function isSafeUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return ['http:', 'https:', 'mailto:'].includes(parsed.protocol);
-  } catch {
-    return false;
+function MarkdownPreview({ markdown }: { markdown: string }) {
+  if (!markdown.trim()) {
+    return <p>本文はまだありません</p>;
   }
-}
 
-function renderInline(text: string): ReactNode[] {
-  const pattern = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+]\([^)]+\))/g;
-  const nodes: ReactNode[] = [];
-  let cursor = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = pattern.exec(text)) !== null) {
-    if (match.index > cursor) {
-      nodes.push(text.slice(cursor, match.index));
-    }
-
-    const token = match[0];
-    const key = `${match.index}-${token}`;
-
-    if (token.startsWith('`')) {
-      nodes.push(<code key={key}>{token.slice(1, -1)}</code>);
-    } else if (token.startsWith('**')) {
-      nodes.push(<strong key={key}>{renderInline(token.slice(2, -2))}</strong>);
-    } else if (token.startsWith('*')) {
-      nodes.push(<em key={key}>{renderInline(token.slice(1, -1))}</em>);
-    } else {
-      const link = /^\[([^\]]+)]\(([^)]+)\)$/.exec(token);
-      const label = link?.[1] ?? token;
-      const url = link?.[2] ?? '';
-      nodes.push(
-        isSafeUrl(url) ? (
-          <a href={url} key={key} rel="noreferrer" target="_blank">
-            {label}
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      skipHtml
+      components={{
+        a: ({ href, children }) => (
+          <a href={href} rel="noreferrer" target="_blank">
+            {children}
           </a>
-        ) : (
-          label
         ),
-      );
-    }
-
-    cursor = match.index + token.length;
-  }
-
-  if (cursor < text.length) {
-    nodes.push(text.slice(cursor));
-  }
-
-  return nodes;
-}
-
-function renderMarkdown(markdown: string): ReactNode[] {
-  const lines = markdown.split('\n');
-  const nodes: ReactNode[] = [];
-  let index = 0;
-
-  while (index < lines.length) {
-    const line = lines[index];
-
-    if (line.trim().startsWith('```')) {
-      const code: string[] = [];
-      index += 1;
-
-      while (index < lines.length && !lines[index].trim().startsWith('```')) {
-        code.push(lines[index]);
-        index += 1;
-      }
-
-      nodes.push(
-        <pre key={`code-${index}`}>
-          <code>{code.join('\n')}</code>
-        </pre>,
-      );
-      index += 1;
-      continue;
-    }
-
-    if (!line.trim()) {
-      index += 1;
-      continue;
-    }
-
-    const heading = /^(#{1,3})\s+(.+)$/.exec(line);
-
-    if (heading) {
-      const level = heading[1].length;
-      const content = renderInline(heading[2]);
-
-      nodes.push(
-        level === 1 ? (
-          <h1 key={`heading-${index}`}>{content}</h1>
-        ) : level === 2 ? (
-          <h2 key={`heading-${index}`}>{content}</h2>
-        ) : (
-          <h3 key={`heading-${index}`}>{content}</h3>
-        ),
-      );
-      index += 1;
-      continue;
-    }
-
-    if (/^>\s?/.test(line)) {
-      const quote: string[] = [];
-
-      while (index < lines.length && /^>\s?/.test(lines[index])) {
-        quote.push(lines[index].replace(/^>\s?/, ''));
-        index += 1;
-      }
-
-      nodes.push(<blockquote key={`quote-${index}`}>{quote.map(renderInline)}</blockquote>);
-      continue;
-    }
-
-    if (/^\s*[-*]\s+/.test(line)) {
-      const items: ReactNode[] = [];
-
-      while (index < lines.length && /^\s*[-*]\s+/.test(lines[index])) {
-        const item = lines[index].replace(/^\s*[-*]\s+/, '');
-        const checked = /^\[[xX ]]\s+/.exec(item);
-        const text = item.replace(/^\[[xX ]]\s+/, '');
-        items.push(
-          <li className={checked ? 'task-item' : undefined} key={`item-${index}`}>
-            {checked ? (
-              <span className="task-check" aria-hidden="true">
-                {/^\[[xX]\]/.test(item) ? <Check size={14} /> : null}
-              </span>
-            ) : null}
-            <span>{renderInline(text)}</span>
-          </li>,
-        );
-        index += 1;
-      }
-
-      nodes.push(<ul key={`list-${index}`}>{items}</ul>);
-      continue;
-    }
-
-    nodes.push(<p key={`paragraph-${index}`}>{renderInline(line)}</p>);
-    index += 1;
-  }
-
-  return nodes.length > 0 ? nodes : [<p key="empty">本文はまだありません</p>];
+      }}
+    >
+      {markdown}
+    </ReactMarkdown>
+  );
 }
 
 export function App() {
@@ -329,14 +210,22 @@ export function App() {
     session: null,
     userEmail: null,
   });
+  const [authMode, setAuthMode] = useState<AuthMode>('password');
   const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authFeedback, setAuthFeedback] = useState<string | null>(null);
   const [isAuthPanelOpen, setIsAuthPanelOpen] = useState(false);
   const [isAuthBusy, setIsAuthBusy] = useState(false);
+  const saveStateRef = useRef<SaveState>('saved');
   const syncInFlightRef = useRef(false);
   const syncNowRef = useRef<((options?: { silent?: boolean }) => Promise<void>) | null>(null);
   const autoSyncTimerRef = useRef<number | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const tagInputRef = useRef<HTMLInputElement | null>(null);
+  const updateSaveState = useCallback((next: SaveState) => {
+    saveStateRef.current = next;
+    setSaveState(next);
+  }, []);
 
   const selectedNote = useMemo(
     () => notes.find((note) => note.id === selectedId) ?? null,
@@ -366,8 +255,6 @@ export function App() {
       .filter((tag) => tag.name.toLocaleLowerCase().includes(current))
       .slice(0, 6);
   }, [currentTagToken, existingTagNames, isTagInputFocused, tags]);
-  const markdownPreview = useMemo(() => renderMarkdown(body), [body]);
-
   const reload = useCallback(async () => {
     const [nextNotes, nextDeletedNotes, nextTags, nextSync, nextPendingEvents] = await Promise.all([
       store.listNotes(query, selectedTagId),
@@ -431,8 +318,8 @@ export function App() {
     setTitle(selectedNote.title);
     setBody(selectedNote.body);
     setTagInput(describeTags(selectedNote.tags));
-    setSaveState('saved');
-  }, [selectedNote]);
+    updateSaveState('saved');
+  }, [selectedNote, updateSaveState]);
 
   const scheduleAutoSync = useCallback(() => {
     if (autoSyncTimerRef.current !== null) {
@@ -458,22 +345,22 @@ export function App() {
       return;
     }
 
-    setSaveState('saving');
+    updateSaveState('saving');
 
     try {
       await store.updateNote(selectedId, { title, body });
       if (!selectedNote || !areTagNamesEqual(selectedNote.tags, tagInput)) {
         await store.setNoteTags(selectedId, tagInput);
       }
-      setSaveState('saved');
+      updateSaveState('saved');
       setNotice('ローカルに保存しました');
       await reload();
       scheduleAutoSync();
     } catch (error) {
-      setSaveState('error');
+      updateSaveState('error');
       setNotice(error instanceof Error ? error.message : '保存に失敗しました');
     }
-  }, [body, reload, scheduleAutoSync, selectedId, selectedNote, tagInput, title]);
+  }, [body, reload, scheduleAutoSync, selectedId, selectedNote, tagInput, title, updateSaveState]);
 
   useDebouncedEffect(
     () => {
@@ -568,6 +455,13 @@ export function App() {
         return;
       }
 
+      if (saveStateRef.current !== 'saved') {
+        if (!options.silent) {
+          setNotice('未保存の変更を保存してから同期してください');
+        }
+        return;
+      }
+
       if (auth.status !== 'signed-in') {
         if (options.silent) {
           return;
@@ -618,6 +512,19 @@ export function App() {
     [auth, reload],
   );
 
+  const syncAfterSaving = useCallback(async () => {
+    if (saveStateRef.current === 'dirty') {
+      await saveCurrent();
+    }
+
+    if (saveStateRef.current === 'saving') {
+      setNotice('保存完了後に同期します');
+      return;
+    }
+
+    await syncNow();
+  }, [saveCurrent, syncNow]);
+
   useEffect(() => {
     syncNowRef.current = syncNow;
   }, [syncNow]);
@@ -647,12 +554,70 @@ export function App() {
   const requestMagicLink = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setIsAuthBusy(true);
+    setAuthFeedback('Magic Link を送信しています...');
 
     try {
       await sendMagicLink(authEmail);
+      setAuthFeedback('ログイン用メールを送信しました。メール内のリンクを開いてください。');
       setNotice('ログイン用メールを送信しました');
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'ログインメールを送信できませんでした');
+      if (isEmailRateLimitError(error)) {
+        setAuthMode('password');
+        setAuthFeedback('送信制限に達しました。メール・パスワードログインをお試しください。');
+        setNotice(
+          'Magic Link の送信制限に達しました。メール・パスワードログインをお試しください。',
+        );
+      } else {
+        const message =
+          error instanceof Error ? error.message : 'ログインメールを送信できませんでした';
+        setAuthFeedback(message);
+        setNotice(message);
+      }
+    } finally {
+      setIsAuthBusy(false);
+    }
+  };
+
+  const logInWithPassword = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setIsAuthBusy(true);
+    setAuthFeedback('ログインしています...');
+
+    try {
+      await signInWithPassword(authEmail, authPassword);
+      setIsAuthPanelOpen(false);
+      setAuthFeedback(null);
+      setNotice('メール・パスワードでログインしました');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'ログインできませんでした';
+      setAuthFeedback(message);
+      setNotice(message);
+    } finally {
+      setIsAuthBusy(false);
+    }
+  };
+
+  const registerWithPassword = async () => {
+    setIsAuthBusy(true);
+    setAuthFeedback('アカウントを登録しています...');
+
+    try {
+      const result = await signUpWithPassword(authEmail, authPassword);
+
+      if (result.status === 'signed-in') {
+        setIsAuthPanelOpen(false);
+        setAuthFeedback(null);
+        setNotice('アカウントを登録し、ログインしました');
+      } else {
+        const message =
+          '確認メールを送信しました。メール内のリンクを開いたあと、この画面からログインしてください。';
+        setAuthFeedback(message);
+        setNotice(message);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'アカウントを登録できませんでした';
+      setAuthFeedback(message);
+      setNotice(message);
     } finally {
       setIsAuthBusy(false);
     }
@@ -685,14 +650,14 @@ export function App() {
       setTagInput(next.tags);
     }
 
-    setSaveState('dirty');
+    updateSaveState('dirty');
   };
 
   const applyTagSuggestion = (tag: Tag) => {
     const prefix = tagInputParts.slice(0, -1).map(normalizeTagName).filter(Boolean);
     const nextTags = [...prefix, tag.name];
     setTagInput(`${nextTags.join(', ')}, `);
-    setSaveState('dirty');
+    updateSaveState('dirty');
     setTagSuggestionIndex(0);
     window.setTimeout(() => tagInputRef.current?.focus(), 0);
   };
@@ -894,18 +859,91 @@ export function App() {
               auth.status === 'unconfigured' ? (
                 <div className="auth-message">Supabase の環境変数が未設定です</div>
               ) : (
-                <form className="auth-form" onSubmit={requestMagicLink}>
-                  <Mail size={16} />
-                  <input
-                    value={authEmail}
-                    onChange={(event) => setAuthEmail(event.target.value)}
-                    placeholder="メールアドレス"
-                    type="email"
-                  />
-                  <button className="plain-button" disabled={isAuthBusy} type="submit">
-                    送信
-                  </button>
-                </form>
+                <div className="auth-panel">
+                  <div className="auth-tabs" role="tablist" aria-label="ログイン方法">
+                    <button
+                      aria-selected={authMode === 'password'}
+                      className={authMode === 'password' ? 'active' : ''}
+                      onClick={() => setAuthMode('password')}
+                      role="tab"
+                      type="button"
+                    >
+                      パスワード
+                    </button>
+                    <button
+                      aria-selected={authMode === 'magic-link'}
+                      className={authMode === 'magic-link' ? 'active' : ''}
+                      onClick={() => setAuthMode('magic-link')}
+                      role="tab"
+                      type="button"
+                    >
+                      Magic Link
+                    </button>
+                  </div>
+                  <div className="auth-feedback" aria-live="polite">
+                    {authFeedback ?? 'メールアドレスとパスワードを入力してください。'}
+                  </div>
+                  {authMode === 'password' ? (
+                    <form className="auth-form password-auth-form" onSubmit={logInWithPassword}>
+                      <span className="auth-input">
+                        <Mail size={16} />
+                        <input
+                          autoComplete="email"
+                          value={authEmail}
+                          onChange={(event) => setAuthEmail(event.target.value)}
+                          placeholder="メールアドレス"
+                          type="email"
+                        />
+                      </span>
+                      <span className="auth-input">
+                        <KeyRound size={16} />
+                        <input
+                          autoComplete="current-password"
+                          value={authPassword}
+                          onChange={(event) => setAuthPassword(event.target.value)}
+                          placeholder="パスワード"
+                          type="password"
+                        />
+                      </span>
+                      <button
+                        className="plain-button auth-action-button"
+                        disabled={isAuthBusy}
+                        type="submit"
+                      >
+                        {isAuthBusy ? '処理中' : 'ログイン'}
+                      </button>
+                      <button
+                        className="plain-button auth-action-button"
+                        disabled={isAuthBusy}
+                        onClick={registerWithPassword}
+                        type="button"
+                      >
+                        <UserPlus size={15} />
+                        {isAuthBusy ? '処理中' : '登録'}
+                      </button>
+                    </form>
+                  ) : (
+                    <form className="auth-form magic-link-form" onSubmit={requestMagicLink}>
+                      <span className="auth-input">
+                        <Mail size={16} />
+                        <input
+                          autoComplete="email"
+                          value={authEmail}
+                          onChange={(event) => setAuthEmail(event.target.value)}
+                          placeholder="メールアドレス"
+                          type="email"
+                        />
+                      </span>
+                      <button
+                        className="plain-button auth-action-button"
+                        disabled={isAuthBusy}
+                        type="submit"
+                      >
+                        {isAuthBusy ? '送信中' : '送信'}
+                      </button>
+                    </form>
+                  )}
+                </div>
               )
             ) : null}
             {auth.status === 'signed-in' ? (
@@ -933,7 +971,7 @@ export function App() {
             <button
               className="plain-button"
               disabled={syncState === 'syncing'}
-              onClick={() => void syncNow()}
+              onClick={() => void syncAfterSaving()}
               type="button"
               title="同期"
             >
@@ -959,6 +997,12 @@ export function App() {
               <span>⌘S 保存</span>
               <span>⌘/ 表示切替</span>
               <span>⌘⌫ 削除</span>
+              <span>Tab 階層を深く</span>
+              <span>⇧Tab 階層を浅く</span>
+              <span>⌘B 太字</span>
+              <span>⌘I 斜体</span>
+              <span>⌘E コード</span>
+              <span>⌘K リンク</span>
             </>
           ) : null}
         </div>
@@ -1047,7 +1091,9 @@ export function App() {
                 <NoteEditor value={body} onChange={(value) => updateDraft({ body: value })} />
               ) : null}
               {editorMode !== 'edit' ? (
-                <article className="markdown-preview">{markdownPreview}</article>
+                <article className="markdown-preview">
+                  <MarkdownPreview markdown={body} />
+                </article>
               ) : null}
             </div>
           </div>

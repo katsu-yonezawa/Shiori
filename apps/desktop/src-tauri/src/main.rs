@@ -155,6 +155,19 @@ fn unique_tag_names(input: &str) -> Vec<String> {
     names
 }
 
+fn normalized_name_keys(names: Vec<String>) -> Vec<String> {
+    let mut keys = names
+        .into_iter()
+        .map(|name| name.to_lowercase())
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
+fn have_same_name_set(left: Vec<String>, right: Vec<String>) -> bool {
+    normalized_name_keys(left) == normalized_name_keys(right)
+}
+
 fn get_device_id(connection: &Connection) -> Result<String, String> {
     let existing = connection
         .query_row(
@@ -487,8 +500,14 @@ fn update_note(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "保存対象のノートが見つかりません。".to_string())?;
 
+    let next_title = normalize_title(&input.title, &input.body);
+
+    if existing.title == next_title && existing.body == input.body {
+        return Ok(existing);
+    }
+
     let note = Note {
-        title: normalize_title(&input.title, &input.body),
+        title: next_title,
         body: input.body,
         updated_at: now_iso(),
         version: existing.version + 1,
@@ -635,6 +654,18 @@ fn set_note_tags(
 ) -> Result<Vec<Tag>, String> {
     let connection = state.connection.lock().map_err(|error| error.to_string())?;
     let names = unique_tag_names(&input);
+    let existing_tags = list_tags_for_note(&connection, &note_id)?;
+
+    if have_same_name_set(
+        existing_tags
+            .iter()
+            .map(|tag| tag.name.clone())
+            .collect::<Vec<_>>(),
+        names.clone(),
+    ) {
+        return Ok(existing_tags);
+    }
+
     let at = now_iso();
     let mut tags = Vec::new();
 
@@ -880,9 +911,34 @@ fn apply_remote_notes(state: State<'_, DbState>, notes: Vec<Note>) -> Result<(),
             .map_err(|error| error.to_string())?;
 
         if let Some(existing) = existing {
+            let has_same_conflict_copy = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM notes
+                       WHERE is_conflict_copy = 1
+                         AND conflict_source_id = ?1
+                         AND title = ?2
+                         AND body = ?3
+                         AND deleted_at IS ?4
+                     )",
+                    params![
+                        &existing.id,
+                        &existing.title,
+                        &existing.body,
+                        &existing.deleted_at
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| error.to_string())?
+                == 1;
+
             if existing.sync_status != "synced"
+                && (existing.title != note.title
+                    || existing.body != note.body
+                    || existing.deleted_at != note.deleted_at)
                 && existing.updated_at != note.updated_at
                 && existing.version != note.version
+                && !has_same_conflict_copy
             {
                 let at = now_iso();
                 let conflict_copy = Note {

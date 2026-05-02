@@ -66,6 +66,7 @@
 | [SHI-023](./completed/SHI-023-keyboard-shortcuts.md) | 基本操作のキーボードショートカットを実装する | P2 | M2 | SHI-004, SHI-005, SHI-007 |
 | [SHI-024](./completed/SHI-024-sync-status-detail.md) | 同期状態の詳細表示を改善する | P2 | M4 | SHI-012, SHI-014 |
 | [SHI-025](./completed/SHI-025-auto-sync-ux.md) | 同期ボタンに頼らない自動同期体験を改善する | P1 | M3 | SHI-012, SHI-013 |
+| [SHI-026](./completed/SHI-026-email-password-auth.md) | メール・パスワードログインを追加する | P1 | M3 | SHI-010 |
 
 ## 初期リリース判定
 

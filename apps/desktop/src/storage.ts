@@ -68,6 +68,19 @@ type NoteStoreDriver = {
   applyRemoteNotes(notes: Note[]): Promise<void>;
 };
 
+function normalizedNameKeys(names: string[]): string[] {
+  return names.map((name) => name.toLocaleLowerCase()).sort();
+}
+
+function haveSameNameSet(left: string[], right: string[]): boolean {
+  const leftKeys = normalizedNameKeys(left);
+  const rightKeys = normalizedNameKeys(right);
+
+  return (
+    leftKeys.length === rightKeys.length && leftKeys.every((key, index) => key === rightKeys[index])
+  );
+}
+
 function isTauriRuntime(): boolean {
   return typeof window !== 'undefined' && '__TAURI_IPC__' in window;
 }
@@ -192,9 +205,16 @@ class IndexedDbNoteStore implements NoteStoreDriver {
       throw new Error('保存対象のノートが見つかりません。');
     }
 
+    const nextTitle = normalizeTitle(input.title, input.body);
+
+    if (existing.title === nextTitle && existing.body === input.body) {
+      await transactionDone(transaction);
+      return existing;
+    }
+
     const next = touchNote({
       ...existing,
-      title: normalizeTitle(input.title, input.body),
+      title: nextTitle,
       body: input.body,
     });
 
@@ -279,6 +299,22 @@ class IndexedDbNoteStore implements NoteStoreDriver {
     const tagsByName = new Map(
       tags.map((tag) => [normalizeTagName(tag.name).toLocaleLowerCase(), tag]),
     );
+    const currentTags = noteTags
+      .filter((relation) => relation.noteId === noteId)
+      .map((relation) => tags.find((tag) => tag.id === relation.tagId))
+      .filter((tag): tag is Tag => Boolean(tag))
+      .sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+
+    if (
+      haveSameNameSet(
+        currentTags.map((tag) => tag.name),
+        wantedNames,
+      )
+    ) {
+      await transactionDone(transaction);
+      return currentTags;
+    }
+
     const nextTags: Tag[] = [];
 
     for (const name of wantedNames) {
@@ -466,6 +502,7 @@ class IndexedDbNoteStore implements NoteStoreDriver {
     const db = await this.dbPromise;
     const transaction = db.transaction(['notes', 'syncEvents'], 'readwrite');
     const noteStore = transaction.objectStore('notes');
+    const localNotes = await readAll<Note>(noteStore);
 
     for (const remote of notes) {
       const existing = await requestToPromise<Note | undefined>(noteStore.get(remote.id));
@@ -473,8 +510,19 @@ class IndexedDbNoteStore implements NoteStoreDriver {
       if (
         existing &&
         existing.syncStatus !== 'synced' &&
+        (existing.title !== remote.title ||
+          existing.body !== remote.body ||
+          existing.deletedAt !== remote.deletedAt) &&
         existing.updatedAt !== remote.updatedAt &&
-        existing.version !== remote.version
+        existing.version !== remote.version &&
+        !localNotes.some(
+          (note) =>
+            note.isConflictCopy &&
+            note.conflictSourceId === existing.id &&
+            note.title === existing.title &&
+            note.body === existing.body &&
+            note.deletedAt === existing.deletedAt,
+        )
       ) {
         const at = nowIso();
         const conflictCopy: Note = {
@@ -490,6 +538,7 @@ class IndexedDbNoteStore implements NoteStoreDriver {
         };
 
         noteStore.put(conflictCopy);
+        localNotes.push(conflictCopy);
         this.enqueue(transaction, 'note.created', 'note', conflictCopy.id, conflictCopy);
       }
 

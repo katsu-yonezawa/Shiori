@@ -17,6 +17,14 @@ export type AuthSnapshot =
       userEmail: string | null;
     };
 
+export type PasswordSignUpResult =
+  | {
+      status: 'signed-in';
+    }
+  | {
+      status: 'confirmation-required';
+    };
+
 type Env = {
   VITE_SUPABASE_URL?: string;
   VITE_SUPABASE_PUBLISHABLE_KEY?: string;
@@ -29,6 +37,10 @@ const supabaseKey =
   env.VITE_SUPABASE_PUBLISHABLE_KEY?.trim() || env.VITE_SUPABASE_ANON_KEY?.trim() || '';
 
 let client: SupabaseClient | null = null;
+
+function normalizeEmail(email: string): string {
+  return email.trim();
+}
 
 export function isAuthConfigured(): boolean {
   return Boolean(supabaseUrl && supabaseKey);
@@ -114,7 +126,7 @@ export async function sendMagicLink(email: string): Promise<void> {
     throw new Error('Supabase の接続情報が未設定です。');
   }
 
-  const normalizedEmail = email.trim();
+  const normalizedEmail = normalizeEmail(email);
 
   if (!normalizedEmail) {
     throw new Error('メールアドレスを入力してください。');
@@ -130,6 +142,73 @@ export async function sendMagicLink(email: string): Promise<void> {
   if (error) {
     throw new Error(error.message);
   }
+}
+
+export async function signInWithPassword(email: string, password: string): Promise<void> {
+  const supabase = getSupabaseClient();
+
+  if (!supabase) {
+    throw new Error('Supabase の接続情報が未設定です。');
+  }
+
+  const normalizedEmail = normalizeEmail(email);
+
+  if (!normalizedEmail) {
+    throw new Error('メールアドレスを入力してください。');
+  }
+
+  if (!password) {
+    throw new Error('パスワードを入力してください。');
+  }
+
+  const { error } = await supabase.auth.signInWithPassword({
+    email: normalizedEmail,
+    password
+  });
+
+  if (error) {
+    throw new Error(error.message);
+  }
+}
+
+export async function signUpWithPassword(
+  email: string,
+  password: string,
+): Promise<PasswordSignUpResult> {
+  const supabase = getSupabaseClient();
+
+  if (!supabase) {
+    throw new Error('Supabase の接続情報が未設定です。');
+  }
+
+  const normalizedEmail = normalizeEmail(email);
+
+  if (!normalizedEmail) {
+    throw new Error('メールアドレスを入力してください。');
+  }
+
+  if (password.length < 6) {
+    throw new Error('パスワードは6文字以上で入力してください。');
+  }
+
+  const { data, error } = await supabase.auth.signUp({
+    email: normalizedEmail,
+    password,
+    options: {
+      emailRedirectTo: window.location.origin
+    }
+  });
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return data.session ? { status: 'signed-in' } : { status: 'confirmation-required' };
+}
+
+export function isEmailRateLimitError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /email.*rate.*limit|rate.*limit.*email|too many requests/i.test(message);
 }
 
 export async function signOut(): Promise<void> {
