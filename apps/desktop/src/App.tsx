@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { NoteEditor } from '@shiori/editor';
 import {
   formatRelativeTime,
@@ -13,15 +13,27 @@ import {
   Cloud,
   FilePlus,
   LogIn,
+  LogOut,
+  Mail,
   RefreshCw,
   Search,
   Tag as TagIcon,
   Trash2
 } from 'lucide-react';
+import {
+  getAuthSnapshot,
+  sendMagicLink,
+  signOut,
+  subscribeToAuthChanges,
+  type AuthSnapshot
+} from './auth';
+import { syncWithSupabase } from './cloudSync';
 import { LocalNoteStore, describeTags } from './storage';
 import { useDebouncedEffect } from './useDebouncedEffect';
 
 const store = new LocalNoteStore();
+
+type SyncState = 'idle' | 'syncing' | 'synced' | 'failed';
 
 function saveStateLabel(state: SaveState): string {
   switch (state) {
@@ -34,6 +46,32 @@ function saveStateLabel(state: SaveState): string {
     case 'saved':
     default:
       return '保存済み';
+  }
+}
+
+function authLabel(auth: AuthSnapshot): string {
+  switch (auth.status) {
+    case 'signed-in':
+      return auth.userEmail ?? 'ログイン中';
+    case 'unconfigured':
+      return 'Supabase未設定';
+    case 'signed-out':
+    default:
+      return '未ログイン';
+  }
+}
+
+function syncStateLabel(state: SyncState): string {
+  switch (state) {
+    case 'syncing':
+      return '同期中';
+    case 'synced':
+      return '同期済み';
+    case 'failed':
+      return '同期失敗';
+    case 'idle':
+    default:
+      return '未同期を確認中';
   }
 }
 
@@ -53,6 +91,16 @@ export function App() {
     lastSyncedAt: null
   });
   const [notice, setNotice] = useState('ローカル保存で利用できます');
+  const [syncState, setSyncState] = useState<SyncState>('idle');
+  const [auth, setAuth] = useState<AuthSnapshot>({
+    status: 'unconfigured',
+    session: null,
+    userEmail: null
+  });
+  const [authEmail, setAuthEmail] = useState('');
+  const [isAuthPanelOpen, setIsAuthPanelOpen] = useState(false);
+  const [isAuthBusy, setIsAuthBusy] = useState(false);
+  const syncInFlightRef = useRef(false);
 
   const selectedNote = useMemo(
     () => notes.find((note) => note.id === selectedId) ?? null,
@@ -78,6 +126,30 @@ export function App() {
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    getAuthSnapshot()
+      .then((snapshot) => {
+        if (isMounted) {
+          setAuth(snapshot);
+        }
+      })
+      .catch((error) => {
+        setNotice(error instanceof Error ? error.message : '認証状態を確認できませんでした');
+      });
+
+    const unsubscribe = subscribeToAuthChanges((snapshot) => {
+      setAuth(snapshot);
+      setNotice(snapshot.status === 'signed-in' ? 'ログインしました' : 'ログアウトしました');
+    });
+
+    return () => {
+      isMounted = false;
+      unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     if (!selectedNote) {
@@ -159,12 +231,107 @@ export function App() {
     await reload();
   };
 
-  const syncNow = async () => {
-    setNotice('同期イベントを確認しています');
-    const next = await store.markAllSynced();
-    setSyncSummary(next);
-    setNotice('ローカルの同期イベントを送信済みにしました');
-    await reload();
+  const syncNow = useCallback(async (options: { silent?: boolean } = {}) => {
+    if (syncInFlightRef.current) {
+      return;
+    }
+
+    if (auth.status !== 'signed-in') {
+      if (options.silent) {
+        return;
+      }
+
+      setIsAuthPanelOpen(true);
+      setSyncState('idle');
+      setNotice(
+        auth.status === 'unconfigured'
+          ? 'Supabase の接続情報を設定すると同期できます'
+          : 'ログインすると同期できます'
+      );
+      return;
+    }
+
+    if (!navigator.onLine) {
+      if (!options.silent) {
+        setNotice('オフラインのため、オンライン復帰後に同期してください');
+      }
+      return;
+    }
+
+    syncInFlightRef.current = true;
+    setSyncState('syncing');
+    if (!options.silent) {
+      setNotice('同期イベントを確認しています');
+    }
+
+    try {
+      const next = await syncWithSupabase(store, auth.session);
+      setSyncSummary(next);
+      setSyncState('synced');
+      if (!options.silent) {
+        setNotice('同期しました');
+      }
+      await reload();
+    } catch (error) {
+      const next = await store.getSyncSummary();
+      setSyncSummary(next);
+      setSyncState('failed');
+      if (!options.silent) {
+        setNotice(error instanceof Error ? error.message : '同期に失敗しました');
+      }
+    } finally {
+      syncInFlightRef.current = false;
+    }
+  }, [auth, reload]);
+
+  useEffect(() => {
+    if (auth.status !== 'signed-in') {
+      return;
+    }
+
+    const syncQuietly = () => {
+      if (document.visibilityState === 'hidden' || !navigator.onLine) {
+        return;
+      }
+
+      void syncNow({ silent: true });
+    };
+
+    const intervalId = window.setInterval(syncQuietly, 60_000);
+    window.addEventListener('online', syncQuietly);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener('online', syncQuietly);
+    };
+  }, [auth.status, syncNow]);
+
+  const requestMagicLink = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setIsAuthBusy(true);
+
+    try {
+      await sendMagicLink(authEmail);
+      setNotice('ログイン用メールを送信しました');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'ログインメールを送信できませんでした');
+    } finally {
+      setIsAuthBusy(false);
+    }
+  };
+
+  const logOut = async () => {
+    setIsAuthBusy(true);
+
+    try {
+      await signOut();
+      setIsAuthPanelOpen(false);
+      setNotice('ログアウトしました');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'ログアウトできませんでした');
+    } finally {
+      setIsAuthBusy(false);
+    }
   };
 
   const updateDraft = (next: { title?: string; body?: string; tags?: string }) => {
@@ -236,6 +403,12 @@ export function App() {
               <span className="note-title">{note.title}</span>
               <span className="note-excerpt">{note.body || '本文はまだありません'}</span>
               <span className="note-meta">
+                {note.isConflictCopy ? (
+                  <>
+                    <span className="conflict-badge">競合コピー</span>
+                    <Circle size={5} fill="currentColor" />
+                  </>
+                ) : null}
                 {note.tags.length > 0 ? describeTags(note.tags) : 'タグなし'}
                 <Circle size={5} fill="currentColor" />
                 {formatRelativeTime(note.updatedAt)}
@@ -259,13 +432,49 @@ export function App() {
             <span className="muted">{notice}</span>
           </div>
           <div className="actions">
-            <button className="plain-button" type="button" title="ログイン">
-              <LogIn size={16} />
-              <span>未ログイン</span>
-            </button>
-            <button className="plain-button" onClick={syncNow} type="button" title="同期">
+            {isAuthPanelOpen && auth.status !== 'signed-in' ? (
+              auth.status === 'unconfigured' ? (
+                <div className="auth-message">Supabase の環境変数が未設定です</div>
+              ) : (
+                <form className="auth-form" onSubmit={requestMagicLink}>
+                  <Mail size={16} />
+                  <input
+                    value={authEmail}
+                    onChange={(event) => setAuthEmail(event.target.value)}
+                    placeholder="メールアドレス"
+                    type="email"
+                  />
+                  <button className="plain-button" disabled={isAuthBusy} type="submit">
+                    送信
+                  </button>
+                </form>
+              )
+            ) : null}
+            {auth.status === 'signed-in' ? (
+              <button className="plain-button" disabled={isAuthBusy} onClick={logOut} type="button" title="ログアウト">
+                <LogOut size={16} />
+                <span>{authLabel(auth)}</span>
+              </button>
+            ) : (
+              <button
+                className="plain-button"
+                onClick={() => setIsAuthPanelOpen((value) => !value)}
+                type="button"
+                title="ログイン"
+              >
+                <LogIn size={16} />
+                <span>{authLabel(auth)}</span>
+              </button>
+            )}
+            <button
+              className="plain-button"
+              disabled={syncState === 'syncing'}
+              onClick={() => void syncNow()}
+              type="button"
+              title="同期"
+            >
               <RefreshCw size={16} />
-              <span>同期</span>
+              <span>{syncState === 'failed' ? '再試行' : '同期'}</span>
             </button>
           </div>
         </header>
@@ -307,8 +516,11 @@ export function App() {
         )}
 
         <footer className="sync-footer">
-          <span>
+          <span className={`sync-state ${syncState}`}>
             <Cloud size={15} />
+            {syncStateLabel(syncState)}
+          </span>
+          <span>
             未同期 {syncSummary.pendingCount} 件
           </span>
           <span>失敗 {syncSummary.failedCount} 件</span>
@@ -318,4 +530,3 @@ export function App() {
     </main>
   );
 }
-

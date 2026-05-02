@@ -14,7 +14,7 @@ struct DbState {
     connection: Mutex<Connection>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Note {
     id: String,
@@ -57,6 +57,21 @@ struct SyncSummary {
     last_synced_at: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncEvent {
+    id: String,
+    #[serde(rename = "type")]
+    event_type: String,
+    entity_id: String,
+    entity_type: String,
+    payload: Value,
+    status: String,
+    created_at: String,
+    sent_at: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateNoteInput {
@@ -92,11 +107,44 @@ fn normalize_tag_name(name: &str) -> String {
     name.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn create_conflict_title(title: &str) -> String {
+    let formatted = time::format_description::parse("[year]/[month]/[day] [hour]:[minute]")
+        .ok()
+        .and_then(|format| OffsetDateTime::now_utc().format(&format).ok())
+        .unwrap_or_else(|| "1970/01/01 00:00".to_string());
+    let base = if title.trim().is_empty() {
+        "無題のノート"
+    } else {
+        title
+    };
+
+    format!("{}（競合コピー {}）", base, formatted)
+}
+
+fn build_fts_query(query: &str) -> Option<String> {
+    let terms = query
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+
+    if terms.is_empty() {
+        return None;
+    }
+
+    Some(terms.join(" AND "))
+}
+
 fn unique_tag_names(input: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut names = Vec::new();
 
-    for name in input.split(',').map(normalize_tag_name).filter(|name| !name.is_empty()) {
+    for name in input
+        .split(',')
+        .map(normalize_tag_name)
+        .filter(|name| !name.is_empty())
+    {
         let key = name.to_lowercase();
 
         if seen.insert(key) {
@@ -109,9 +157,11 @@ fn unique_tag_names(input: &str) -> Vec<String> {
 
 fn get_device_id(connection: &Connection) -> Result<String, String> {
     let existing = connection
-        .query_row("SELECT value FROM app_meta WHERE key = 'device_id'", [], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_row(
+            "SELECT value FROM app_meta WHERE key = 'device_id'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
         .optional()
         .map_err(|error| error.to_string())?;
 
@@ -128,9 +178,11 @@ fn get_device_id(connection: &Connection) -> Result<String, String> {
         .map_err(|error| error.to_string())?;
 
     Ok(connection
-        .query_row("SELECT value FROM app_meta WHERE key = 'device_id'", [], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_row(
+            "SELECT value FROM app_meta WHERE key = 'device_id'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
         .map_err(|error| error.to_string())?)
 }
 
@@ -149,6 +201,22 @@ fn row_to_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
         sync_status: row.get("sync_status")?,
         is_conflict_copy: row.get::<_, i64>("is_conflict_copy")? != 0,
         conflict_source_id: row.get("conflict_source_id")?,
+    })
+}
+
+fn row_to_sync_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncEvent> {
+    let payload_text: String = row.get("payload")?;
+
+    Ok(SyncEvent {
+        id: row.get("id")?,
+        event_type: row.get("type")?,
+        entity_id: row.get("entity_id")?,
+        entity_type: row.get("entity_type")?,
+        payload: serde_json::from_str(&payload_text).unwrap_or(Value::Null),
+        status: row.get("status")?,
+        created_at: row.get("created_at")?,
+        sent_at: row.get("sent_at")?,
+        error: row.get("error")?,
     })
 }
 
@@ -217,6 +285,9 @@ fn init_database(app: &AppHandle) -> Result<Connection, String> {
     connection
         .execute_batch(MIGRATION)
         .map_err(|error| error.to_string())?;
+    connection
+        .execute("INSERT INTO notes_fts(notes_fts) VALUES ('rebuild')", [])
+        .map_err(|error| error.to_string())?;
     Ok(connection)
 }
 
@@ -227,26 +298,49 @@ fn list_notes(
     tag_id: Option<String>,
 ) -> Result<Vec<NoteWithTags>, String> {
     let connection = state.connection.lock().map_err(|error| error.to_string())?;
-    let search = format!("%{}%", query.trim().to_lowercase());
+    let trimmed_query = query.trim();
 
-    let mut statement = connection
-        .prepare(
-            "SELECT *
-             FROM notes n
-             WHERE n.deleted_at IS NULL
-               AND (?1 = '' OR lower(n.title) LIKE ?2 OR lower(n.body) LIKE ?2)
-               AND (?3 IS NULL OR EXISTS (
-                 SELECT 1 FROM note_tags nt WHERE nt.note_id = n.id AND nt.tag_id = ?3
-               ))
-             ORDER BY n.updated_at DESC",
-        )
-        .map_err(|error| error.to_string())?;
+    let notes = if let Some(fts_query) = build_fts_query(trimmed_query) {
+        let mut statement = connection
+            .prepare(
+                "SELECT n.*
+                 FROM notes n
+                 JOIN notes_fts ON notes_fts.rowid = n.rowid
+                 WHERE n.deleted_at IS NULL
+                   AND notes_fts MATCH ?1
+                   AND (?2 IS NULL OR EXISTS (
+                     SELECT 1 FROM note_tags nt WHERE nt.note_id = n.id AND nt.tag_id = ?2
+                   ))
+                 ORDER BY bm25(notes_fts), n.updated_at DESC",
+            )
+            .map_err(|error| error.to_string())?;
 
-    let notes = statement
-        .query_map(params![query.trim(), search, tag_id], row_to_note)
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![fts_query, tag_id], row_to_note)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    } else {
+        let mut statement = connection
+            .prepare(
+                "SELECT *
+                 FROM notes n
+                 WHERE n.deleted_at IS NULL
+                   AND (?1 IS NULL OR EXISTS (
+                     SELECT 1 FROM note_tags nt WHERE nt.note_id = n.id AND nt.tag_id = ?1
+                   ))
+                 ORDER BY n.updated_at DESC",
+            )
+            .map_err(|error| error.to_string())?;
+
+        let rows = statement
+            .query_map(params![tag_id], row_to_note)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
 
     notes
         .into_iter()
@@ -338,7 +432,11 @@ fn update_note(
 ) -> Result<Note, String> {
     let connection = state.connection.lock().map_err(|error| error.to_string())?;
     let existing = connection
-        .query_row("SELECT * FROM notes WHERE id = ?1", params![id], row_to_note)
+        .query_row(
+            "SELECT * FROM notes WHERE id = ?1",
+            params![id],
+            row_to_note,
+        )
         .optional()
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "保存対象のノートが見つかりません。".to_string())?;
@@ -358,7 +456,13 @@ fn update_note(
             "UPDATE notes
              SET title = ?2, body = ?3, updated_at = ?4, version = ?5, sync_status = 'pending'
              WHERE id = ?1",
-            params![&note.id, &note.title, &note.body, &note.updated_at, note.version],
+            params![
+                &note.id,
+                &note.title,
+                &note.body,
+                &note.updated_at,
+                note.version
+            ],
         )
         .map_err(|error| error.to_string())?;
 
@@ -370,7 +474,11 @@ fn update_note(
 fn soft_delete_note(state: State<'_, DbState>, id: String) -> Result<(), String> {
     let connection = state.connection.lock().map_err(|error| error.to_string())?;
     let existing = connection
-        .query_row("SELECT * FROM notes WHERE id = ?1", params![id], row_to_note)
+        .query_row(
+            "SELECT * FROM notes WHERE id = ?1",
+            params![id],
+            row_to_note,
+        )
         .optional()
         .map_err(|error| error.to_string())?;
 
@@ -396,7 +504,11 @@ fn soft_delete_note(state: State<'_, DbState>, id: String) -> Result<(), String>
 }
 
 #[tauri::command]
-fn set_note_tags(state: State<'_, DbState>, note_id: String, input: String) -> Result<Vec<Tag>, String> {
+fn set_note_tags(
+    state: State<'_, DbState>,
+    note_id: String,
+    input: String,
+) -> Result<Vec<Tag>, String> {
     let connection = state.connection.lock().map_err(|error| error.to_string())?;
     let names = unique_tag_names(&input);
     let at = now_iso();
@@ -442,7 +554,10 @@ fn set_note_tags(state: State<'_, DbState>, note_id: String, input: String) -> R
     }
 
     connection
-        .execute("DELETE FROM note_tags WHERE note_id = ?1", params![&note_id])
+        .execute(
+            "DELETE FROM note_tags WHERE note_id = ?1",
+            params![&note_id],
+        )
         .map_err(|error| error.to_string())?;
 
     for tag in &tags {
@@ -507,7 +622,10 @@ fn mark_all_synced(state: State<'_, DbState>) -> Result<SyncSummary, String> {
         )
         .map_err(|error| error.to_string())?;
     connection
-        .execute("UPDATE notes SET sync_status = 'synced' WHERE sync_status != 'synced'", [])
+        .execute(
+            "UPDATE notes SET sync_status = 'synced' WHERE sync_status != 'synced'",
+            [],
+        )
         .map_err(|error| error.to_string())?;
     connection
         .execute(
@@ -519,6 +637,212 @@ fn mark_all_synced(state: State<'_, DbState>) -> Result<SyncSummary, String> {
 
     drop(connection);
     get_sync_summary(state)
+}
+
+#[tauri::command]
+fn list_pending_sync_events(state: State<'_, DbState>) -> Result<Vec<SyncEvent>, String> {
+    let connection = state.connection.lock().map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, type, entity_id, entity_type, payload, status, created_at, sent_at, error
+             FROM sync_events
+             WHERE status IN ('pending', 'failed')
+             ORDER BY created_at ASC",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let rows = statement
+        .query_map([], row_to_sync_event)
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    Ok(rows)
+}
+
+#[tauri::command]
+fn mark_sync_events(
+    state: State<'_, DbState>,
+    ids: Vec<String>,
+    status: String,
+    error: Option<String>,
+) -> Result<(), String> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    let connection = state.connection.lock().map_err(|error| error.to_string())?;
+    let at = now_iso();
+
+    for id in ids {
+        let event = connection
+            .query_row(
+                "SELECT id, type, entity_id, entity_type, payload, status, created_at, sent_at, error
+                 FROM sync_events
+                 WHERE id = ?1",
+                params![&id],
+                row_to_sync_event,
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+
+        let Some(event) = event else {
+            continue;
+        };
+
+        connection
+            .execute(
+                "UPDATE sync_events
+                 SET status = ?2,
+                     sent_at = CASE WHEN ?2 = 'sent' THEN ?3 ELSE sent_at END,
+                     error = CASE WHEN ?2 = 'failed' THEN ?4 ELSE NULL END
+                 WHERE id = ?1",
+                params![&event.id, &status, &at, &error],
+            )
+            .map_err(|error| error.to_string())?;
+
+        if status == "sent" && event.entity_type == "note" {
+            connection
+                .execute(
+                    "UPDATE notes SET sync_status = 'synced' WHERE id = ?1",
+                    params![&event.entity_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+
+    if status == "sent" {
+        connection
+            .execute(
+                "INSERT INTO app_meta (key, value) VALUES ('last_synced_at', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![&at],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn apply_remote_notes(state: State<'_, DbState>, notes: Vec<Note>) -> Result<(), String> {
+    if notes.is_empty() {
+        return Ok(());
+    }
+
+    let mut connection = state.connection.lock().map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+
+    for note in notes {
+        let existing = transaction
+            .query_row(
+                "SELECT * FROM notes WHERE id = ?1",
+                params![&note.id],
+                row_to_note,
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+
+        if let Some(existing) = existing {
+            if existing.sync_status != "synced"
+                && existing.updated_at != note.updated_at
+                && existing.version != note.version
+            {
+                let at = now_iso();
+                let conflict_copy = Note {
+                    id: create_id("note"),
+                    title: create_conflict_title(&existing.title),
+                    created_at: at.clone(),
+                    updated_at: at,
+                    version: 1,
+                    sync_status: "pending".to_string(),
+                    is_conflict_copy: true,
+                    conflict_source_id: Some(existing.id.clone()),
+                    ..existing
+                };
+                let payload =
+                    serde_json::to_value(&conflict_copy).map_err(|error| error.to_string())?;
+
+                transaction
+                    .execute(
+                        "INSERT INTO notes
+                         (id, user_id, title, body, body_format, created_at, updated_at, deleted_at, version,
+                          device_id, sync_status, is_conflict_copy, conflict_source_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                        params![
+                            &conflict_copy.id,
+                            &conflict_copy.user_id,
+                            &conflict_copy.title,
+                            &conflict_copy.body,
+                            &conflict_copy.body_format,
+                            &conflict_copy.created_at,
+                            &conflict_copy.updated_at,
+                            &conflict_copy.deleted_at,
+                            conflict_copy.version,
+                            &conflict_copy.device_id,
+                            &conflict_copy.sync_status,
+                            conflict_copy.is_conflict_copy as i64,
+                            &conflict_copy.conflict_source_id
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?;
+
+                transaction
+                    .execute(
+                        "INSERT INTO sync_events
+                         (id, type, entity_id, entity_type, payload, status, created_at, sent_at, error)
+                         VALUES (?1, 'note.created', ?2, 'note', ?3, 'pending', ?4, NULL, NULL)",
+                        params![
+                            create_id("sync"),
+                            &conflict_copy.id,
+                            payload.to_string(),
+                            now_iso()
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO notes
+                 (id, user_id, title, body, body_format, created_at, updated_at, deleted_at, version,
+                  device_id, sync_status, is_conflict_copy, conflict_source_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'synced', ?11, ?12)
+                 ON CONFLICT(id) DO UPDATE SET
+                   user_id = excluded.user_id,
+                   title = excluded.title,
+                   body = excluded.body,
+                   body_format = excluded.body_format,
+                   created_at = excluded.created_at,
+                   updated_at = excluded.updated_at,
+                   deleted_at = excluded.deleted_at,
+                   version = excluded.version,
+                   device_id = excluded.device_id,
+                   sync_status = 'synced',
+                   is_conflict_copy = excluded.is_conflict_copy,
+                   conflict_source_id = excluded.conflict_source_id",
+                params![
+                    &note.id,
+                    &note.user_id,
+                    &note.title,
+                    &note.body,
+                    &note.body_format,
+                    &note.created_at,
+                    &note.updated_at,
+                    &note.deleted_at,
+                    note.version,
+                    &note.device_id,
+                    note.is_conflict_copy as i64,
+                    &note.conflict_source_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn main() {
@@ -538,7 +862,10 @@ fn main() {
             soft_delete_note,
             set_note_tags,
             get_sync_summary,
-            mark_all_synced
+            mark_all_synced,
+            list_pending_sync_events,
+            mark_sync_events,
+            apply_remote_notes
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Shiori");

@@ -28,6 +28,11 @@ button {
   border: 0;
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
 .app-shell {
   display: grid;
   grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
@@ -205,6 +210,11 @@ button {
   text-overflow: ellipsis;
 }
 
+.conflict-badge {
+  flex: 0 0 auto;
+  color: #8b2c24;
+}
+
 .empty-state,
 .welcome-panel {
   display: flex;
@@ -244,6 +254,8 @@ button {
 
 .actions {
   flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .muted {
@@ -252,6 +264,41 @@ button {
   font-size: 13px;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+.auth-form,
+.auth-message {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid #d8dfda;
+  border-radius: 8px;
+  background: #f1f5f2;
+  color: #4f594f;
+}
+
+.auth-form input {
+  width: 190px;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #252525;
+}
+
+.auth-form .plain-button {
+  min-height: 28px;
+  padding: 0 10px;
+  background: #fffaf0;
+}
+
+.auth-message {
+  color: #7a4c20;
+  background: #f7ead4;
+  border-color: #ead4b4;
+  font-size: 13px;
 }
 
 .save-pill {
@@ -343,6 +390,22 @@ button {
   gap: 6px;
 }
 
+.sync-state {
+  color: #725113;
+}
+
+.sync-state.syncing {
+  color: #315f83;
+}
+
+.sync-state.synced {
+  color: #285e36;
+}
+
+.sync-state.failed {
+  color: #8b2c24;
+}
+
 @media (max-width: 780px) {
   .app-shell {
     grid-template-columns: 1fr;
@@ -364,4 +427,3 @@ button {
     font-size: 25px;
   }
 }
-

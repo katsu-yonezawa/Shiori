@@ -17,6 +17,7 @@
     "@shiori/editor": "0.1.0",
     "@shiori/schema": "0.1.0",
     "@shiori/ui": "0.1.0",
+    "@supabase/supabase-js": "^2.105.1",
     "@tauri-apps/api": "^1.6.0",
     "@vitejs/plugin-react": "^6.0.1",
     "lucide-react": "^0.468.0",

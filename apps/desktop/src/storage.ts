@@ -1,5 +1,6 @@
 import {
   createBlankNote,
+  createConflictTitle,
   createId,
   formatTags,
   matchesNote,
@@ -57,6 +58,9 @@ type NoteStoreDriver = {
   setNoteTags(noteId: string, input: string): Promise<Tag[]>;
   getSyncSummary(): Promise<LocalSyncSummary>;
   markAllSynced(): Promise<LocalSyncSummary>;
+  listPendingSyncEvents(): Promise<SyncEvent[]>;
+  markSyncEvents(ids: string[], status: SyncEvent['status'], error?: string | null): Promise<void>;
+  applyRemoteNotes(notes: Note[]): Promise<void>;
 };
 
 function isTauriRuntime(): boolean {
@@ -94,6 +98,18 @@ class TauriNoteStore implements NoteStoreDriver {
 
   markAllSynced(): Promise<LocalSyncSummary> {
     return invoke('mark_all_synced');
+  }
+
+  listPendingSyncEvents(): Promise<SyncEvent[]> {
+    return invoke('list_pending_sync_events');
+  }
+
+  markSyncEvents(ids: string[], status: SyncEvent['status'], error: string | null = null): Promise<void> {
+    return invoke('mark_sync_events', { ids, status, error });
+  }
+
+  applyRemoteNotes(notes: Note[]): Promise<void> {
+    return invoke('apply_remote_notes', { notes });
   }
 }
 
@@ -279,6 +295,98 @@ class IndexedDbNoteStore implements NoteStoreDriver {
     return this.getSyncSummary();
   }
 
+  async listPendingSyncEvents(): Promise<SyncEvent[]> {
+    const db = await this.dbPromise;
+    const transaction = db.transaction('syncEvents', 'readonly');
+    const events = await readAll<SyncEvent>(transaction.objectStore('syncEvents'));
+    await transactionDone(transaction);
+    return events
+      .filter((event) => event.status === 'pending' || event.status === 'failed')
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  async markSyncEvents(
+    ids: string[],
+    status: SyncEvent['status'],
+    error: string | null = null
+  ): Promise<void> {
+    if (ids.length === 0) {
+      return;
+    }
+
+    const at = nowIso();
+    const idSet = new Set(ids);
+    const db = await this.dbPromise;
+    const transaction = db.transaction(['notes', 'syncEvents', 'meta'], 'readwrite');
+    const noteStore = transaction.objectStore('notes');
+    const eventStore = transaction.objectStore('syncEvents');
+    const events = await readAll<SyncEvent>(eventStore);
+
+    for (const event of events.filter((event) => idSet.has(event.id))) {
+      eventStore.put({
+        ...event,
+        status,
+        sentAt: status === 'sent' ? at : event.sentAt,
+        error: status === 'failed' ? error : null
+      });
+
+      if (status === 'sent' && event.entityType === 'note') {
+        const note = await requestToPromise<Note | undefined>(noteStore.get(event.entityId));
+
+        if (note) {
+          noteStore.put({ ...note, syncStatus: 'synced' });
+        }
+      }
+    }
+
+    if (status === 'sent') {
+      transaction.objectStore('meta').put(at, lastSyncedKey);
+    }
+
+    await transactionDone(transaction);
+  }
+
+  async applyRemoteNotes(notes: Note[]): Promise<void> {
+    if (notes.length === 0) {
+      return;
+    }
+
+    const db = await this.dbPromise;
+    const transaction = db.transaction(['notes', 'syncEvents'], 'readwrite');
+    const noteStore = transaction.objectStore('notes');
+
+    for (const remote of notes) {
+      const existing = await requestToPromise<Note | undefined>(noteStore.get(remote.id));
+
+      if (
+        existing &&
+        existing.syncStatus !== 'synced' &&
+        existing.updatedAt !== remote.updatedAt &&
+        existing.version !== remote.version
+      ) {
+        const at = nowIso();
+        const conflictCopy: Note = {
+          ...existing,
+          id: createId('note'),
+          title: createConflictTitle(existing.title),
+          createdAt: at,
+          updatedAt: at,
+          version: 1,
+          syncStatus: 'pending',
+          isConflictCopy: true,
+          conflictSourceId: existing.id
+        };
+
+        noteStore.put(conflictCopy);
+        this.enqueue(transaction, 'note.created', 'note', conflictCopy.id, conflictCopy);
+      }
+
+      noteStore.put({ ...remote, syncStatus: 'synced' });
+    }
+
+    await transactionDone(transaction);
+  }
+
   private open(): Promise<IDBDatabase> {
     return new Promise((resolve, reject) => {
       const request = indexedDB.open(dbName, dbVersion);
@@ -373,6 +481,22 @@ export class LocalNoteStore implements NoteStoreDriver {
 
   markAllSynced(): Promise<LocalSyncSummary> {
     return this.driver.markAllSynced();
+  }
+
+  listPendingSyncEvents(): Promise<SyncEvent[]> {
+    return this.driver.listPendingSyncEvents();
+  }
+
+  markSyncEvents(
+    ids: string[],
+    status: SyncEvent['status'],
+    error: string | null = null
+  ): Promise<void> {
+    return this.driver.markSyncEvents(ids, status, error);
+  }
+
+  applyRemoteNotes(notes: Note[]): Promise<void> {
+    return this.driver.applyRemoteNotes(notes);
   }
 }
 

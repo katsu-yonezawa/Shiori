@@ -34,13 +34,6 @@
 
 | ID | タイトル | 優先度 | マイルストーン | 依存 |
 | --- | --- | --- | --- | --- |
-| [SHI-007](./SHI-007-sqlite-fts-search.md) | SQLite FTS5 による全文検索を実装する | P1 | M2 | SHI-003, SHI-004 |
-| [SHI-009](./SHI-009-supabase-schema-auth-rls.md) | Supabase の認証、テーブル、RLS を設計する | P0 | M3 | SHI-003 |
-| [SHI-010](./SHI-010-supabase-auth-desktop.md) | macOS アプリに Supabase Auth ログインを接続する | P0 | M3 | SHI-002, SHI-009 |
-| [SHI-012](./SHI-012-manual-diff-sync.md) | 手動同期で push / pull できる差分同期を実装する | P0 | M3 | SHI-009, SHI-010, SHI-011 |
-| [SHI-013](./SHI-013-simple-auto-sync.md) | 簡易的な自動同期を実装する | P1 | M3 | SHI-012 |
-| [SHI-014](./SHI-014-sync-status-ui.md) | 同期状態とエラーをUIで確認できるようにする | P1 | M4 | SHI-012 |
-| [SHI-015](./SHI-015-conflict-copy.md) | 競合時にコピーを残す処理を実装する | P0 | M4 | SHI-012 |
 | [SHI-016](./SHI-016-web-feasibility.md) | Web 版の成立性を確認する | P2 | M5 | SHI-001, SHI-012 |
 | [SHI-017](./SHI-017-iphone-implementation-comparison.md) | iPhone 版の実装方式を比較する | P2 | M5 | SHI-001 |
 
@@ -56,8 +49,15 @@
 | [SHI-004](./completed/SHI-004-local-note-crud.md) | ノートの作成、編集、削除をローカルDBで実装する | P0 | M1 | SHI-002, SHI-003 |
 | [SHI-005](./completed/SHI-005-editor-autosave.md) | 本文エディタと自動保存を実装する | P0 | M1 | SHI-004 |
 | [SHI-006](./completed/SHI-006-soft-delete-notes.md) | 削除済みノートを `deleted_at` で扱う | P0 | M1 | SHI-004 |
+| [SHI-007](./completed/SHI-007-sqlite-fts-search.md) | SQLite FTS5 による全文検索を実装する | P1 | M2 | SHI-003, SHI-004 |
 | [SHI-008](./completed/SHI-008-tags.md) | タグ付けとタグ検索を実装する | P1 | M2 | SHI-003, SHI-004 |
+| [SHI-009](./completed/SHI-009-supabase-schema-auth-rls.md) | Supabase の認証、テーブル、RLS を設計する | P0 | M3 | SHI-003 |
+| [SHI-010](./completed/SHI-010-supabase-auth-desktop.md) | macOS アプリに Supabase Auth ログインを接続する | P0 | M3 | SHI-002, SHI-009 |
 | [SHI-011](./completed/SHI-011-sync-events.md) | ローカル変更を `sync_events` に記録する | P0 | M3 | SHI-004, SHI-006 |
+| [SHI-012](./completed/SHI-012-manual-diff-sync.md) | 手動同期で push / pull できる差分同期を実装する | P0 | M3 | SHI-009, SHI-010, SHI-011 |
+| [SHI-013](./completed/SHI-013-simple-auto-sync.md) | 簡易的な自動同期を実装する | P1 | M3 | SHI-012 |
+| [SHI-014](./completed/SHI-014-sync-status-ui.md) | 同期状態とエラーをUIで確認できるようにする | P1 | M4 | SHI-012 |
+| [SHI-015](./completed/SHI-015-conflict-copy.md) | 競合時にコピーを残す処理を実装する | P0 | M4 | SHI-012 |
 
 ## 初期リリース判定
 
