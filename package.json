@@ -1,0 +1,23 @@
+{
+  "name": "shiori",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local-first note app for macOS.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @shiori/desktop",
+    "build": "npm run build --workspaces",
+    "lint": "npm run lint --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "prettier": "^3.2.5",
+    "typescript": "^5.4.5"
+  }
+}
+

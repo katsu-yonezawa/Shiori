@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/1",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devPath": "http://127.0.0.1:5173",
+    "distDir": "../dist"
+  },
+  "package": {
+    "productName": "Shiori",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "shell": {
+        "all": false,
+        "open": true
+      }
+    },
+    "bundle": {
+      "active": true,
+      "identifier": "app.shiori.desktop",
+      "targets": ["dmg", "app"]
+    },
+    "windows": [
+      {
+        "title": "Shiori",
+        "width": 1180,
+        "height": 780,
+        "minWidth": 900,
+        "minHeight": 620
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  }
+}
+

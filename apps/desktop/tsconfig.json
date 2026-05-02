@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@shiori/core": ["../../packages/core/src/index.ts"],
+      "@shiori/editor": ["../../packages/editor/src/index.tsx"],
+      "@shiori/schema": ["../../packages/schema/src/index.ts"],
+      "@shiori/ui": ["../../packages/ui/src/index.tsx"]
+    }
+  },
+  "include": ["src", "vite.config.ts"]
+}
