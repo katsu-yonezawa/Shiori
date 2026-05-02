@@ -15,7 +15,7 @@ import {
   type NoteWithTags,
   type SyncEvent,
   type SyncEventType,
-  type Tag
+  type Tag,
 } from '@shiori/core';
 import { invoke } from '@tauri-apps/api/tauri';
 
@@ -40,8 +40,10 @@ function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {
 function transactionDone(transaction: IDBTransaction): Promise<void> {
   return new Promise((resolve, reject) => {
     transaction.oncomplete = () => resolve();
-    transaction.onerror = () => reject(transaction.error ?? new Error('IndexedDB transaction failed.'));
-    transaction.onabort = () => reject(transaction.error ?? new Error('IndexedDB transaction aborted.'));
+    transaction.onerror = () =>
+      reject(transaction.error ?? new Error('IndexedDB transaction failed.'));
+    transaction.onabort = () =>
+      reject(transaction.error ?? new Error('IndexedDB transaction aborted.'));
   });
 }
 
@@ -51,10 +53,13 @@ async function readAll<T>(store: IDBObjectStore): Promise<T[]> {
 
 type NoteStoreDriver = {
   listNotes(query?: string, tagId?: string | null): Promise<NoteWithTags[]>;
+  listDeletedNotes(): Promise<NoteWithTags[]>;
   listTags(): Promise<Tag[]>;
   createNote(): Promise<NoteWithTags>;
   updateNote(id: string, input: { title: string; body: string }): Promise<Note>;
   softDeleteNote(id: string): Promise<void>;
+  restoreNote(id: string): Promise<void>;
+  deleteTag(id: string): Promise<void>;
   setNoteTags(noteId: string, input: string): Promise<Tag[]>;
   getSyncSummary(): Promise<LocalSyncSummary>;
   markAllSynced(): Promise<LocalSyncSummary>;
@@ -76,6 +81,10 @@ class TauriNoteStore implements NoteStoreDriver {
     return invoke('list_tags');
   }
 
+  listDeletedNotes(): Promise<NoteWithTags[]> {
+    return invoke('list_deleted_notes');
+  }
+
   createNote(): Promise<NoteWithTags> {
     return invoke('create_note');
   }
@@ -86,6 +95,14 @@ class TauriNoteStore implements NoteStoreDriver {
 
   softDeleteNote(id: string): Promise<void> {
     return invoke('soft_delete_note', { id });
+  }
+
+  restoreNote(id: string): Promise<void> {
+    return invoke('restore_note', { id });
+  }
+
+  deleteTag(id: string): Promise<void> {
+    return invoke('delete_tag', { id });
   }
 
   setNoteTags(noteId: string, input: string): Promise<Tag[]> {
@@ -104,7 +121,11 @@ class TauriNoteStore implements NoteStoreDriver {
     return invoke('list_pending_sync_events');
   }
 
-  markSyncEvents(ids: string[], status: SyncEvent['status'], error: string | null = null): Promise<void> {
+  markSyncEvents(
+    ids: string[],
+    status: SyncEvent['status'],
+    error: string | null = null,
+  ): Promise<void> {
     return invoke('mark_sync_events', { ids, status, error });
   }
 
@@ -121,45 +142,34 @@ class IndexedDbNoteStore implements NoteStoreDriver {
   }
 
   async listNotes(query = '', tagId: string | null = null): Promise<NoteWithTags[]> {
-    const db = await this.dbPromise;
-    const transaction = db.transaction(['notes', 'tags', 'noteTags'], 'readonly');
-    const notes = await readAll<Note>(transaction.objectStore('notes'));
-    const tags = await readAll<Tag>(transaction.objectStore('tags'));
-    const noteTags = await readAll<NoteTag>(transaction.objectStore('noteTags'));
-    await transactionDone(transaction);
-
-    const tagById = new Map(tags.map((tag) => [tag.id, tag]));
-    const tagsByNote = new Map<string, Tag[]>();
-
-    for (const relation of noteTags) {
-      const tag = tagById.get(relation.tagId);
-
-      if (!tag) {
-        continue;
-      }
-
-      const existing = tagsByNote.get(relation.noteId) ?? [];
-      existing.push(tag);
-      tagsByNote.set(relation.noteId, existing);
-    }
+    const notes = await this.listNotesWithTags();
 
     return notes
       .filter((note) => !note.deletedAt)
-      .map((note) => ({
-        ...note,
-        tags: (tagsByNote.get(note.id) ?? []).sort((a, b) => a.name.localeCompare(b.name, 'ja'))
-      }))
       .filter((note) => matchesNote(note, query))
       .filter((note) => !tagId || note.tags.some((tag) => tag.id === tagId))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
+  async listDeletedNotes(): Promise<NoteWithTags[]> {
+    const notes = await this.listNotesWithTags();
+
+    return notes
+      .filter((note) => note.deletedAt)
+      .sort((a, b) => (b.deletedAt ?? '').localeCompare(a.deletedAt ?? ''));
+  }
+
   async listTags(): Promise<Tag[]> {
     const db = await this.dbPromise;
-    const transaction = db.transaction('tags', 'readonly');
+    const transaction = db.transaction(['tags', 'noteTags'], 'readonly');
     const tags = await readAll<Tag>(transaction.objectStore('tags'));
+    const noteTags = await readAll<NoteTag>(transaction.objectStore('noteTags'));
     await transactionDone(transaction);
-    return tags.sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+    const usedTagIds = new Set(noteTags.map((relation) => relation.tagId));
+
+    return tags
+      .filter((tag) => usedTagIds.has(tag.id))
+      .sort((a, b) => a.name.localeCompare(b.name, 'ja'));
   }
 
   async createNote(): Promise<NoteWithTags> {
@@ -185,7 +195,7 @@ class IndexedDbNoteStore implements NoteStoreDriver {
     const next = touchNote({
       ...existing,
       title: normalizeTitle(input.title, input.body),
-      body: input.body
+      body: input.body,
     });
 
     noteStore.put(next);
@@ -210,15 +220,65 @@ class IndexedDbNoteStore implements NoteStoreDriver {
     await transactionDone(transaction);
   }
 
+  async restoreNote(id: string): Promise<void> {
+    const db = await this.dbPromise;
+    const transaction = db.transaction(['notes', 'syncEvents'], 'readwrite');
+    const noteStore = transaction.objectStore('notes');
+    const existing = await requestToPromise<Note | undefined>(noteStore.get(id));
+
+    if (!existing) {
+      return;
+    }
+
+    const next = touchNote({ ...existing, deletedAt: null });
+    noteStore.put(next);
+    this.enqueue(transaction, 'note.restored', 'note', next.id, next);
+    await transactionDone(transaction);
+  }
+
+  async deleteTag(id: string): Promise<void> {
+    const db = await this.dbPromise;
+    const transaction = db.transaction(['notes', 'tags', 'noteTags', 'syncEvents'], 'readwrite');
+    const noteStore = transaction.objectStore('notes');
+    const tagStore = transaction.objectStore('tags');
+    const noteTagStore = transaction.objectStore('noteTags');
+    const noteTags = await readAll<NoteTag>(noteTagStore);
+    const affectedNoteIds = new Set<string>();
+
+    for (const relation of noteTags.filter((relation) => relation.tagId === id)) {
+      affectedNoteIds.add(relation.noteId);
+      noteTagStore.delete(relation.id);
+    }
+
+    tagStore.delete(id);
+
+    for (const noteId of affectedNoteIds) {
+      const note = await requestToPromise<Note | undefined>(noteStore.get(noteId));
+
+      if (!note) {
+        continue;
+      }
+
+      const next = touchNote(note);
+      noteStore.put(next);
+      this.enqueue(transaction, 'tags.updated', 'note', noteId, { noteId, tags: [] });
+    }
+
+    await transactionDone(transaction);
+  }
+
   async setNoteTags(noteId: string, input: string): Promise<Tag[]> {
     const wantedNames = uniqueTagNames(input);
     const db = await this.dbPromise;
-    const transaction = db.transaction(['tags', 'noteTags', 'syncEvents'], 'readwrite');
+    const transaction = db.transaction(['notes', 'tags', 'noteTags', 'syncEvents'], 'readwrite');
+    const noteStore = transaction.objectStore('notes');
     const tagStore = transaction.objectStore('tags');
     const noteTagStore = transaction.objectStore('noteTags');
     const tags = await readAll<Tag>(tagStore);
     const noteTags = await readAll<NoteTag>(noteTagStore);
-    const tagsByName = new Map(tags.map((tag) => [normalizeTagName(tag.name).toLocaleLowerCase(), tag]));
+    const tagsByName = new Map(
+      tags.map((tag) => [normalizeTagName(tag.name).toLocaleLowerCase(), tag]),
+    );
     const nextTags: Tag[] = [];
 
     for (const name of wantedNames) {
@@ -246,16 +306,67 @@ class IndexedDbNoteStore implements NoteStoreDriver {
         id: `${noteId}:${tag.id}`,
         noteId,
         tagId: tag.id,
-        createdAt: nowIso()
+        createdAt: nowIso(),
       });
+    }
+
+    await this.pruneUnusedTags(transaction);
+
+    const note = await requestToPromise<Note | undefined>(noteStore.get(noteId));
+
+    if (note) {
+      noteStore.put(touchNote(note));
     }
 
     this.enqueue(transaction, 'tags.updated', 'note', noteId, {
       noteId,
-      tags: nextTags.map((tag) => tag.name)
+      tags: nextTags.map((tag) => tag.name),
     });
     await transactionDone(transaction);
     return nextTags;
+  }
+
+  private async listNotesWithTags(): Promise<NoteWithTags[]> {
+    const db = await this.dbPromise;
+    const transaction = db.transaction(['notes', 'tags', 'noteTags'], 'readonly');
+    const notes = await readAll<Note>(transaction.objectStore('notes'));
+    const tags = await readAll<Tag>(transaction.objectStore('tags'));
+    const noteTags = await readAll<NoteTag>(transaction.objectStore('noteTags'));
+    await transactionDone(transaction);
+
+    const tagById = new Map(tags.map((tag) => [tag.id, tag]));
+    const tagsByNote = new Map<string, Tag[]>();
+
+    for (const relation of noteTags) {
+      const tag = tagById.get(relation.tagId);
+
+      if (!tag) {
+        continue;
+      }
+
+      const existing = tagsByNote.get(relation.noteId) ?? [];
+      existing.push(tag);
+      tagsByNote.set(relation.noteId, existing);
+    }
+
+    return notes.map((note) => ({
+      ...note,
+      tags: (tagsByNote.get(note.id) ?? []).sort((a, b) => a.name.localeCompare(b.name, 'ja')),
+    }));
+  }
+
+  private async pruneUnusedTags(transaction: IDBTransaction): Promise<void> {
+    const tagStore = transaction.objectStore('tags');
+    const noteTagStore = transaction.objectStore('noteTags');
+    const tags = await readAll<Tag>(transaction.objectStore('tags'));
+    const noteTags = await readAll<NoteTag>(noteTagStore);
+    const usedTagIds = new Set(noteTags.map((relation) => relation.tagId));
+
+    for (const tag of tags) {
+      if (!usedTagIds.has(tag.id)) {
+        tagStore.delete(tag.id);
+      }
+    }
   }
 
   async getSyncSummary(): Promise<LocalSyncSummary> {
@@ -263,8 +374,9 @@ class IndexedDbNoteStore implements NoteStoreDriver {
     const transaction = db.transaction(['syncEvents', 'meta'], 'readonly');
     const events = await readAll<SyncEvent>(transaction.objectStore('syncEvents'));
     const lastSyncedAt =
-      (await requestToPromise<string | undefined>(transaction.objectStore('meta').get(lastSyncedKey))) ??
-      null;
+      (await requestToPromise<string | undefined>(
+        transaction.objectStore('meta').get(lastSyncedKey),
+      )) ?? null;
     await transactionDone(transaction);
     return summarizeSync(events, lastSyncedAt);
   }
@@ -308,7 +420,7 @@ class IndexedDbNoteStore implements NoteStoreDriver {
   async markSyncEvents(
     ids: string[],
     status: SyncEvent['status'],
-    error: string | null = null
+    error: string | null = null,
   ): Promise<void> {
     if (ids.length === 0) {
       return;
@@ -327,7 +439,7 @@ class IndexedDbNoteStore implements NoteStoreDriver {
         ...event,
         status,
         sentAt: status === 'sent' ? at : event.sentAt,
-        error: status === 'failed' ? error : null
+        error: status === 'failed' ? error : null,
       });
 
       if (status === 'sent' && event.entityType === 'note') {
@@ -374,7 +486,7 @@ class IndexedDbNoteStore implements NoteStoreDriver {
           version: 1,
           syncStatus: 'pending',
           isConflictCopy: true,
-          conflictSourceId: existing.id
+          conflictSourceId: existing.id,
         };
 
         noteStore.put(conflictCopy);
@@ -425,7 +537,7 @@ class IndexedDbNoteStore implements NoteStoreDriver {
     type: SyncEventType,
     entityType: SyncEvent['entityType'],
     entityId: string,
-    payload: unknown
+    payload: unknown,
   ) {
     const at = nowIso();
     const event: SyncEvent = {
@@ -437,7 +549,7 @@ class IndexedDbNoteStore implements NoteStoreDriver {
       status: 'pending',
       createdAt: at,
       sentAt: null,
-      error: null
+      error: null,
     };
 
     transaction.objectStore('syncEvents').put(event);
@@ -459,6 +571,10 @@ export class LocalNoteStore implements NoteStoreDriver {
     return this.driver.listTags();
   }
 
+  listDeletedNotes(): Promise<NoteWithTags[]> {
+    return this.driver.listDeletedNotes();
+  }
+
   createNote(): Promise<NoteWithTags> {
     return this.driver.createNote();
   }
@@ -469,6 +585,14 @@ export class LocalNoteStore implements NoteStoreDriver {
 
   softDeleteNote(id: string): Promise<void> {
     return this.driver.softDeleteNote(id);
+  }
+
+  restoreNote(id: string): Promise<void> {
+    return this.driver.restoreNote(id);
+  }
+
+  deleteTag(id: string): Promise<void> {
+    return this.driver.deleteTag(id);
   }
 
   setNoteTags(noteId: string, input: string): Promise<Tag[]> {
@@ -490,7 +614,7 @@ export class LocalNoteStore implements NoteStoreDriver {
   markSyncEvents(
     ids: string[],
     status: SyncEvent['status'],
-    error: string | null = null
+    error: string | null = null,
   ): Promise<void> {
     return this.driver.markSyncEvents(ids, status, error);
   }

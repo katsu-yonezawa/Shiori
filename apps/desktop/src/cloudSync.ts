@@ -48,7 +48,7 @@ function toRemoteNote(note: Note, userId: string): RemoteNote {
     device_id: note.deviceId,
     sync_status: 'synced',
     is_conflict_copy: note.isConflictCopy,
-    conflict_source_id: note.conflictSourceId
+    conflict_source_id: note.conflictSourceId,
   };
 }
 
@@ -66,7 +66,7 @@ function fromRemoteNote(note: RemoteNote): Note {
     deviceId: note.device_id,
     syncStatus: 'synced',
     isConflictCopy: note.is_conflict_copy,
-    conflictSourceId: note.conflict_source_id
+    conflictSourceId: note.conflict_source_id,
   };
 }
 
@@ -76,7 +76,7 @@ function toRemoteTags(tags: Tag[], userId: string): RemoteTag[] {
     user_id: userId,
     name: tag.name,
     created_at: tag.createdAt,
-    updated_at: tag.updatedAt
+    updated_at: tag.updatedAt,
   }));
 }
 
@@ -85,7 +85,7 @@ function toRemoteNoteTags(note: NoteWithTags, userId: string): RemoteNoteTag[] {
     note_id: note.id,
     tag_id: tag.id,
     user_id: userId,
-    created_at: new Date().toISOString()
+    created_at: new Date().toISOString(),
   }));
 }
 
@@ -133,9 +133,9 @@ async function pushDeleteEvent(event: SyncEvent): Promise<void> {
       .update({
         deleted_at: deletedAt,
         updated_at: deletedAt,
-        sync_status: 'synced'
+        sync_status: 'synced',
       })
-      .eq('id', noteId)
+      .eq('id', noteId),
   );
 }
 
@@ -157,8 +157,33 @@ async function pushSyncEvent(event: SyncEvent, userId: string): Promise<void> {
       status: 'sent',
       created_at: event.createdAt,
       sent_at: new Date().toISOString(),
-      error: null
-    })
+      error: null,
+    }),
+  );
+}
+
+async function cleanupRemoteUnusedTags(userId: string): Promise<void> {
+  const supabase = getSupabaseClient();
+
+  if (!supabase) {
+    throw new Error('Supabase の接続情報が未設定です。');
+  }
+
+  const noteTags = (await throwIfError(
+    await supabase.from('note_tags').select('tag_id').eq('user_id', userId),
+  )) as Pick<RemoteNoteTag, 'tag_id'>[];
+  const tags = (await throwIfError(
+    await supabase.from('tags').select('id').eq('user_id', userId),
+  )) as Pick<RemoteTag, 'id'>[];
+  const usedTagIds = new Set(noteTags.map((relation) => relation.tag_id));
+  const unusedTagIds = tags.map((tag) => tag.id).filter((id) => !usedTagIds.has(id));
+
+  if (unusedTagIds.length === 0) {
+    return;
+  }
+
+  await throwIfError(
+    await supabase.from('tags').delete().eq('user_id', userId).in('id', unusedTagIds),
   );
 }
 
@@ -181,7 +206,7 @@ async function pullRemoteNotes(store: LocalNoteStore, since: string | null): Pro
 
 export async function syncWithSupabase(
   store: LocalNoteStore,
-  session: Session
+  session: Session,
 ): Promise<LocalSyncSummary> {
   const userId = session.user.id;
   const beforeSync = await store.getSyncSummary();
@@ -209,6 +234,7 @@ export async function syncWithSupabase(
       await pushSyncEvent(event, userId);
     }
 
+    await cleanupRemoteUnusedTags(userId);
     await pullRemoteNotes(store, beforeSync.lastSyncedAt);
 
     if (eventIds.length > 0) {
@@ -223,7 +249,7 @@ export async function syncWithSupabase(
       await store.markSyncEvents(
         eventIds,
         'failed',
-        error instanceof Error ? error.message : '同期に失敗しました'
+        error instanceof Error ? error.message : '同期に失敗しました',
       );
     }
 

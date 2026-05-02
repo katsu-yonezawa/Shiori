@@ -58,6 +58,14 @@
 | [SHI-013](./completed/SHI-013-simple-auto-sync.md) | 簡易的な自動同期を実装する | P1 | M3 | SHI-012 |
 | [SHI-014](./completed/SHI-014-sync-status-ui.md) | 同期状態とエラーをUIで確認できるようにする | P1 | M4 | SHI-012 |
 | [SHI-015](./completed/SHI-015-conflict-copy.md) | 競合時にコピーを残す処理を実装する | P0 | M4 | SHI-012 |
+| [SHI-018](./completed/SHI-018-tag-management-enhancement.md) | タグ管理を強化する | P1 | M2 | SHI-008, SHI-012 |
+| [SHI-019](./completed/SHI-019-markdown-text-support.md) | Markdown テキストに対応する | P1 | M2 | SHI-005, SHI-012 |
+| [SHI-020](./completed/SHI-020-tag-autocomplete.md) | タグ入力の補完と表記ゆれ防止を実装する | P1 | M2 | SHI-008, SHI-018 |
+| [SHI-021](./completed/SHI-021-deleted-notes-restore.md) | 削除済みノートの一覧と復元を実装する | P1 | M4 | SHI-006, SHI-012 |
+| [SHI-022](./completed/SHI-022-note-list-readability.md) | ノート一覧の見やすさを改善する | P1 | M2 | SHI-004, SHI-007, SHI-008 |
+| [SHI-023](./completed/SHI-023-keyboard-shortcuts.md) | 基本操作のキーボードショートカットを実装する | P2 | M2 | SHI-004, SHI-005, SHI-007 |
+| [SHI-024](./completed/SHI-024-sync-status-detail.md) | 同期状態の詳細表示を改善する | P2 | M4 | SHI-012, SHI-014 |
+| [SHI-025](./completed/SHI-025-auto-sync-ux.md) | 同期ボタンに頼らない自動同期体験を改善する | P1 | M3 | SHI-012, SHI-013 |
 
 ## 初期リリース判定
 

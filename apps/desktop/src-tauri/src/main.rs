@@ -247,6 +247,20 @@ fn list_tags_for_note(connection: &Connection, note_id: &str) -> Result<Vec<Tag>
     Ok(tags)
 }
 
+fn delete_unused_tags(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute(
+            "DELETE FROM tags
+             WHERE NOT EXISTS (
+               SELECT 1 FROM note_tags nt WHERE nt.tag_id = tags.id
+             )",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
 fn enqueue_sync_event(
     connection: &Connection,
     event_type: &str,
@@ -355,7 +369,12 @@ fn list_notes(
 fn list_tags(state: State<'_, DbState>) -> Result<Vec<Tag>, String> {
     let connection = state.connection.lock().map_err(|error| error.to_string())?;
     let mut statement = connection
-        .prepare("SELECT id, name, created_at, updated_at FROM tags ORDER BY name COLLATE NOCASE")
+        .prepare(
+            "SELECT id, name, created_at, updated_at
+             FROM tags
+             WHERE EXISTS (SELECT 1 FROM note_tags nt WHERE nt.tag_id = tags.id)
+             ORDER BY name COLLATE NOCASE",
+        )
         .map_err(|error| error.to_string())?;
 
     let tags = statement
@@ -372,6 +391,33 @@ fn list_tags(state: State<'_, DbState>) -> Result<Vec<Tag>, String> {
         .map_err(|error| error.to_string())?;
 
     Ok(tags)
+}
+
+#[tauri::command]
+fn list_deleted_notes(state: State<'_, DbState>) -> Result<Vec<NoteWithTags>, String> {
+    let connection = state.connection.lock().map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT *
+             FROM notes
+             WHERE deleted_at IS NOT NULL
+             ORDER BY deleted_at DESC",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let notes = statement
+        .query_map([], row_to_note)
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    notes
+        .into_iter()
+        .map(|note| {
+            let tags = list_tags_for_note(&connection, &note.id)?;
+            Ok(NoteWithTags { note, tags })
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -504,6 +550,84 @@ fn soft_delete_note(state: State<'_, DbState>, id: String) -> Result<(), String>
 }
 
 #[tauri::command]
+fn restore_note(state: State<'_, DbState>, id: String) -> Result<(), String> {
+    let connection = state.connection.lock().map_err(|error| error.to_string())?;
+    let existing = connection
+        .query_row(
+            "SELECT * FROM notes WHERE id = ?1",
+            params![id],
+            row_to_note,
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+
+    let updated_at = now_iso();
+    connection
+        .execute(
+            "UPDATE notes
+             SET deleted_at = NULL, updated_at = ?2, version = ?3, sync_status = 'pending'
+             WHERE id = ?1",
+            params![&existing.id, &updated_at, existing.version + 1],
+        )
+        .map_err(|error| error.to_string())?;
+
+    let restored = Note {
+        deleted_at: None,
+        updated_at,
+        version: existing.version + 1,
+        sync_status: "pending".to_string(),
+        ..existing
+    };
+    let payload = serde_json::to_value(&restored).map_err(|error| error.to_string())?;
+    enqueue_sync_event(&connection, "note.restored", "note", &restored.id, payload)
+}
+
+#[tauri::command]
+fn delete_tag(state: State<'_, DbState>, id: String) -> Result<(), String> {
+    let connection = state.connection.lock().map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare("SELECT DISTINCT note_id FROM note_tags WHERE tag_id = ?1")
+        .map_err(|error| error.to_string())?;
+    let note_ids = statement
+        .query_map(params![&id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    connection
+        .execute("DELETE FROM note_tags WHERE tag_id = ?1", params![&id])
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute("DELETE FROM tags WHERE id = ?1", params![&id])
+        .map_err(|error| error.to_string())?;
+
+    for note_id in note_ids {
+        let updated_at = now_iso();
+        connection
+            .execute(
+                "UPDATE notes
+                 SET updated_at = ?2, version = version + 1, sync_status = 'pending'
+                 WHERE id = ?1",
+                params![&note_id, &updated_at],
+            )
+            .map_err(|error| error.to_string())?;
+
+        let tags = list_tags_for_note(&connection, &note_id)?;
+        let payload = serde_json::json!({
+            "noteId": &note_id,
+            "tags": tags.iter().map(|tag| tag.name.clone()).collect::<Vec<_>>()
+        });
+        enqueue_sync_event(&connection, "tags.updated", "note", &note_id, payload)?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 fn set_note_tags(
     state: State<'_, DbState>,
     note_id: String,
@@ -568,6 +692,16 @@ fn set_note_tags(
             )
             .map_err(|error| error.to_string())?;
     }
+
+    delete_unused_tags(&connection)?;
+    connection
+        .execute(
+            "UPDATE notes
+             SET updated_at = ?2, version = version + 1, sync_status = 'pending'
+             WHERE id = ?1",
+            params![&note_id, now_iso()],
+        )
+        .map_err(|error| error.to_string())?;
 
     let payload = serde_json::json!({
         "noteId": &note_id,
@@ -857,9 +991,12 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_notes,
             list_tags,
+            list_deleted_notes,
             create_note,
             update_note,
             soft_delete_note,
+            restore_note,
+            delete_tag,
             set_note_tags,
             get_sync_summary,
             mark_all_synced,

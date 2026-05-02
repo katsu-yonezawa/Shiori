@@ -7,6 +7,7 @@ export type SyncEventStatus = 'pending' | 'syncing' | 'sent' | 'failed';
 export type SyncEventType =
   | 'note.created'
   | 'note.updated'
+  | 'note.restored'
   | 'note.deleted'
   | 'tags.updated';
 
@@ -56,4 +57,3 @@ export type LocalSyncSummary = {
 };
 
 export type SaveState = 'saved' | 'dirty' | 'saving' | 'error';
-
